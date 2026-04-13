@@ -1,3 +1,18 @@
+# Secrets — never commit
 .env
-etc
+.env.local
+.env.production
+
+# Dependencies
+node_modules
+
+# Playwright browsers cache
 playwright-browsers
+
+# Build output
+dist
+etc
+
+# OS files
+.DS_Store
+Thumbs.db

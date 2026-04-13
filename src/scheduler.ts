@@ -177,10 +177,10 @@ export class SchedulerService {
 
         console.log(`📋 [${executionId}] Mission created: ${mission._id}`);
 
-        const scraperArgs = ['--import', 'tsx', 'src/scraper.ts', `"${keyword}"`, '--max-ads', maxAdsPerRequest.toString(), '--daily-limit', dailyLimit.toString(), '--mission-id', mission._id.toString()];
+        const scraperArgs = ['--import', 'tsx', 'src/scraper.ts', keyword, '--max-ads', maxAdsPerRequest.toString(), '--daily-limit', dailyLimit.toString(), '--mission-id', mission._id.toString()];
         const playwrightPath = path.resolve(process.cwd(), 'playwright-browsers');
         const scraper = spawn(process.execPath, scraperArgs, {
-            shell: true,
+            shell: false,
             detached: false,
             stdio: ['inherit', 'pipe', 'pipe'],
             env: {
@@ -193,12 +193,14 @@ export class SchedulerService {
         let scriptOutput = '';
         let isTimeout = false;
         
-        // Set up timeout for long-running jobs
+        // Scale timeout with target size: ~2min per 100 ads, minimum 30min, maximum 10hrs
+        const scaledTimeoutMs = Math.max(30 * 60 * 1000, Math.min(10 * 60 * 60 * 1000, Math.ceil(maxAdsPerRequest / 100) * 2 * 60 * 1000));
+        console.log(`⏱️ [${executionId}] Timeout set to ${Math.round(scaledTimeoutMs / 60000)}min for ${maxAdsPerRequest} ads target`);
         const timeoutTimer = setTimeout(() => {
             isTimeout = true;
-            console.warn(`⏰ [${executionId}] Job timeout reached, terminating...`);
+            console.warn(`⏰ [${executionId}] Job timeout reached (${Math.round(scaledTimeoutMs / 60000)}min), terminating...`);
             scraper.kill('SIGTERM');
-        }, 30 * 60 * 1000); // 30 minutes timeout
+        }, scaledTimeoutMs);
 
         scraper.stdout.on('data', (data) => {
             const output = data.toString();
