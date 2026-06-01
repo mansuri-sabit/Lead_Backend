@@ -135,7 +135,75 @@ filterBotCommenterSchema.index({ userId: 1, runId: 1 });
 const FilterBotRun = mongoose.model('FilterBotRun', filterBotRunSchema);
 const FilterBotCommenter = mongoose.model('FilterBotCommenter', filterBotCommenterSchema);
 
-export { Ad, Mission, Scheduler, User, FilterBotRun, FilterBotCommenter };
+// ─── Lead Capture Schemas ────────────────────────────────────────────────────
+
+const leadCaptureRunSchema = new Schema({
+    userId: { type: String, required: true, index: true },
+    status: { type: String, default: 'pending', enum: ['pending', 'running', 'completed', 'failed'] },
+    totalCompanies: { type: Number, default: 0 },
+    processedCount: { type: Number, default: 0 },
+    completedCount: { type: Number, default: 0 },
+    failedCount: { type: Number, default: 0 },
+    processingTimeMs: { type: Number, default: 0 },
+    errorMessage: { type: String, default: null },
+    createdAt: { type: Date, default: Date.now },
+    updatedAt: { type: Date, default: Date.now },
+});
+leadCaptureRunSchema.index({ userId: 1, createdAt: -1 });
+
+const leadCaptureResultSchema = new Schema({
+    runId: { type: Schema.Types.ObjectId, ref: 'LeadCaptureRun', required: true, index: true },
+    userId: { type: String, required: true, index: true },
+    rowIndex: { type: Number, required: true },
+    companyName: { type: String, required: true },
+    // Agent 1 — Google Maps data
+    mapsAddress: { type: String, default: '' },
+    mapsPhone: { type: String, default: '' },
+    mapsWebsite: { type: String, default: '' },
+    mapsRating: { type: String, default: '' },
+    mapsReviewCount: { type: String, default: '' },
+    mapsCategory: { type: String, default: '' },
+    openingTime: { type: String, default: '' },
+    closingTime: { type: String, default: '' },
+    currentStatus: { type: String, default: '' },
+    openingHours: { type: Schema.Types.Mixed, default: [] },
+    agent1Status: { type: String, default: 'pending', enum: ['pending', 'running', 'completed', 'failed'] },
+    agent1Error: { type: String, default: null },
+    // Agent 2 — Website analysis data
+    websiteUrl: { type: String, default: '' },
+    popupDetected: { type: Boolean, default: false },
+    popupType: { type: String, default: 'none' },
+    extractedText: { type: String, default: '' },
+    ocrText: { type: String, default: '' },
+    interpretedMeaning: { type: String, default: '' },
+    score: { type: Number, default: 0 },
+    lastUpdatedYears: { type: Number, default: null },
+    lastUpdatedAt: { type: Date, default: null },
+    freshnessSource: { type: String, default: '' },
+    freshnessScore: { type: Number, default: 0 },
+    techProfile: { type: Schema.Types.Mixed, default: {} },
+    recommendedServices: { type: [Schema.Types.Mixed], default: [] },
+    signals: { type: [String], default: [] },
+    summary: { type: String, default: '' },
+    popupScreenshot: { type: String, default: null },  // /screenshots/<runId>/<row>-popup.jpg
+    fullScreenshot: { type: String, default: null },    // /screenshots/<runId>/<row>-full.jpg
+    pageTitle: { type: String, default: '' },
+    agent2Status: { type: String, default: 'pending', enum: ['pending', 'running', 'completed', 'failed', 'skipped'] },
+    agent2Error: { type: String, default: null },
+    // Agent 3 — Website Audit (on-demand)
+    audit: { type: Schema.Types.Mixed, default: null },
+    auditStatus: { type: String, default: 'idle', enum: ['idle', 'running', 'completed', 'failed'] },
+    // Timestamps
+    processedAt: { type: Date, default: null },
+    createdAt: { type: Date, default: Date.now },
+});
+leadCaptureResultSchema.index({ runId: 1, rowIndex: 1 }, { unique: true });
+leadCaptureResultSchema.index({ userId: 1, runId: 1 });
+
+const LeadCaptureRun = mongoose.model('LeadCaptureRun', leadCaptureRunSchema);
+const LeadCaptureResult = mongoose.model('LeadCaptureResult', leadCaptureResultSchema);
+
+export { Ad, Mission, Scheduler, User, FilterBotRun, FilterBotCommenter, LeadCaptureRun, LeadCaptureResult };
 
 export async function connectDB() {
     if (mongoose.connection.readyState >= 1) return;
@@ -838,4 +906,169 @@ export async function deleteFilterBotRun(ownerUserId: string, runId: string): Pr
     const deletedRows = await FilterBotCommenter.deleteMany({ runId: rid, userId: ownerUserId });
     await FilterBotRun.deleteOne({ _id: rid, userId: ownerUserId });
     return { deletedCount: deletedRows.deletedCount || 0 };
+}
+
+// ─── Lead Capture CRUD ───────────────────────────────────────────────────────
+
+/**
+ * Create a new lead capture run and seed result rows for each company.
+ */
+export async function createLeadCaptureRun(
+    userId: string,
+    companies: string[]
+): Promise<{ runId: string }> {
+    await connectDB();
+    const run = new LeadCaptureRun({
+        userId,
+        status: 'running',
+        totalCompanies: companies.length,
+    });
+    await run.save();
+    const runId = (run as any)._id;
+
+    const docs = companies.map((name, i) => ({
+        runId,
+        userId,
+        rowIndex: i,
+        companyName: name.trim(),
+    }));
+
+    if (docs.length > 0) {
+        await LeadCaptureResult.insertMany(docs, { ordered: false });
+    }
+
+    return { runId: runId.toString() };
+}
+
+/**
+ * Update a single lead capture result row with Agent 1 (Google Maps) data.
+ */
+export async function updateLeadCaptureAgent1(
+    userId: string,
+    runId: string,
+    rowIndex: number,
+    data: Record<string, unknown>
+): Promise<void> {
+    await connectDB();
+    const rid = runId as unknown as mongoose.Types.ObjectId;
+    await LeadCaptureResult.updateOne(
+        { runId: rid, userId, rowIndex },
+        { $set: { ...data, agent1Status: data.agent1Status || 'completed' } }
+    );
+}
+
+/**
+ * Update a single lead capture result row with Agent 2 (Website Analyzer) data.
+ */
+export async function updateLeadCaptureAgent2(
+    userId: string,
+    runId: string,
+    rowIndex: number,
+    data: Record<string, unknown>
+): Promise<void> {
+    await connectDB();
+    const rid = runId as unknown as mongoose.Types.ObjectId;
+    await LeadCaptureResult.updateOne(
+        { runId: rid, userId, rowIndex },
+        { $set: { ...data, agent2Status: data.agent2Status || 'completed', processedAt: new Date() } }
+    );
+}
+
+/**
+ * Finalize a lead capture run — set status, counts, timing.
+ */
+export async function finalizeLeadCaptureRun(
+    userId: string,
+    runId: string,
+    patch: { status: string; processedCount?: number; completedCount?: number; failedCount?: number; processingTimeMs?: number; errorMessage?: string }
+): Promise<void> {
+    await connectDB();
+    const rid = runId as unknown as mongoose.Types.ObjectId;
+    await LeadCaptureRun.updateOne(
+        { _id: rid, userId },
+        { $set: { ...patch, updatedAt: new Date() } }
+    );
+}
+
+/**
+ * List all lead capture runs for a user.
+ */
+export async function listLeadCaptureRuns(userId: string): Promise<any[]> {
+    await connectDB();
+    return LeadCaptureRun.find({ userId }).sort({ createdAt: -1 }).limit(50).lean();
+}
+
+/**
+ * Get a specific lead capture run with its result rows (paginated).
+ */
+// Heavy fields excluded from list responses by default — fetched on demand.
+const LEAD_CAPTURE_HEAVY_FIELDS = '-extractedText -ocrText';
+
+export async function getLeadCaptureRunResults(
+    userId: string,
+    runId: string,
+    page = 1,
+    limit = 100,
+    opts: { includeHeavy?: boolean } = {}
+): Promise<{ run: any; results: any[]; total: number; page: number; totalPages: number }> {
+    await connectDB();
+    const safePage = Math.max(1, Math.floor(page));
+    const safeLimit = Math.min(500, Math.max(1, Math.floor(limit)));
+
+    const rid = runId as unknown as mongoose.Types.ObjectId;
+    const run = await LeadCaptureRun.findOne({ _id: rid, userId }).lean();
+    if (!run) return { run: null, results: [], total: 0, page: safePage, totalPages: 0 };
+
+    const total = await LeadCaptureResult.countDocuments({ runId: rid, userId });
+    const skip = (safePage - 1) * safeLimit;
+    const query = LeadCaptureResult.find({ runId: rid, userId })
+        .sort({ rowIndex: 1 })
+        .skip(skip)
+        .limit(safeLimit);
+    if (!opts.includeHeavy) {
+        query.select(LEAD_CAPTURE_HEAVY_FIELDS);
+    }
+    const results = await query.lean();
+
+    return { run, results, total, page: safePage, totalPages: Math.ceil(total / safeLimit) };
+}
+
+/**
+ * Get the latest lead capture run with results.
+ */
+export async function getLatestLeadCaptureRun(
+    userId: string,
+    page = 1,
+    limit = 100,
+    opts: { includeHeavy?: boolean } = {}
+): Promise<{ run: any; results: any[]; total: number; page: number; totalPages: number }> {
+    await connectDB();
+    const run = await LeadCaptureRun.findOne({ userId }).sort({ createdAt: -1 }).lean();
+    if (!run) return { run: null, results: [], total: 0, page, totalPages: 0 };
+    return getLeadCaptureRunResults(userId, (run as any)._id.toString(), page, limit, opts);
+}
+
+/**
+ * Delete a lead capture run and all its results.
+ */
+export async function deleteLeadCaptureRun(userId: string, runId: string): Promise<{ deletedCount: number }> {
+    await connectDB();
+    if (!mongoose.isValidObjectId(runId)) return { deletedCount: 0 };
+    const rid = runId as unknown as mongoose.Types.ObjectId;
+    const exists = await LeadCaptureRun.exists({ _id: rid, userId });
+    if (!exists) return { deletedCount: 0 };
+    const deleted = await LeadCaptureResult.deleteMany({ runId: rid, userId });
+    await LeadCaptureRun.deleteOne({ _id: rid, userId });
+
+    // Best-effort cleanup of on-disk screenshots for this run.
+    try {
+        const fs = await import('fs');
+        const path = await import('path');
+        const dir = path.resolve(process.cwd(), 'screenshots', String(runId));
+        await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+    } catch {
+        // non-critical
+    }
+
+    return { deletedCount: deleted.deletedCount || 0 };
 }

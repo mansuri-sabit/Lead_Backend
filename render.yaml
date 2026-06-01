@@ -1,19 +1,17 @@
 services:
   - type: web
     name: facebook-backend
-    runtime: node
+    runtime: docker
     region: singapore
-    plan: free
-    buildCommand: npm install && PLAYWRIGHT_BROWSERS_PATH=./playwright-browsers node node_modules/playwright/cli.js install chromium
-    startCommand: npm start
+    plan: standard            # Playwright + OCR need ~2GB RAM; free/starter will OOM
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
     envVars:
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/project/src/playwright-browsers
       - key: NODE_ENV
         value: production
       - key: MONGODB_URI
-        sync: false
+        sync: false           # paste your MongoDB Atlas SRV string in the dashboard
       - key: JWT_SECRET
         generateValue: true
       - key: FRONTEND_URL
-        sync: false
+        sync: false           # your deployed frontend origin (used for CORS)

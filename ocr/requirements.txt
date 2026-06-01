@@ -1,0 +1,3 @@
+# Primary OCR engine — PaddleOCR (PP-OCRv5, fast + accurate on stylized text)
+paddlepaddle==3.0.0
+paddleocr>=3.4

@@ -1,4 +1,4 @@
-import { chromium } from 'playwright';
+import { createStealthPage } from './browserFlow.js';
 
 /**
  * Extracts users who liked a Facebook post
@@ -7,38 +7,21 @@ import { chromium } from 'playwright';
  */
 export async function extractFacebookPostLikes(postUrl) {
     let browser;
+    let context;
     let page;
+    let ownsBrowser = true;
+    let ownsContext = true;
     
     try {
         console.log('🌐 Launching browser for Facebook post likes extraction...');
         
         // Launch browser with improved settings
-        browser = await chromium.launch({
-            headless: true, // Use headless for better stability
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-extensions',
-                '--disable-plugins',
-                '--disable-web-security',
-                '--disable-features=VizDisplayCompositor'
-            ]
-        });
-
-        const context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        ({ browser, context, page, ownsBrowser, ownsContext } = await createStealthPage({
+            headless: true,
             viewport: { width: 1366, height: 768 },
             locale: 'en-US',
             timezoneId: 'America/New_York',
-            ignoreHTTPSErrors: true,
-            acceptDownloads: false
-        });
-
-        page = await context.newPage();
+        }));
 
         // Set up error handling for page
         page.on('error', (error) => {
@@ -318,7 +301,10 @@ export async function extractFacebookPostLikes(postUrl) {
         if (page) {
             await page.close().catch(() => {});
         }
-        if (browser) {
+        if (ownsContext && context) {
+            await context.close().catch(() => {});
+        }
+        if (ownsBrowser && browser) {
             await browser.close().catch(() => {});
         }
     }

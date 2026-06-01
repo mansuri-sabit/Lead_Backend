@@ -1,4 +1,4 @@
-import { chromium } from 'playwright';
+import { createStealthPage } from './browserFlow.js';
 
 /**
  * Simple Facebook post likes extraction with fallback
@@ -7,26 +7,21 @@ import { chromium } from 'playwright';
  */
 export async function extractFacebookPostLikes(postUrl) {
     let browser;
+    let context;
     let page;
+    let ownsBrowser = true;
+    let ownsContext = true;
     
     try {
         console.log('🌐 Starting simple Facebook post likes extraction...');
         
         // Launch browser with minimal settings for stability
-        browser = await chromium.launch({
+        ({ browser, context, page, ownsBrowser, ownsContext } = await createStealthPage({
             headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage'
-            ]
-        });
-
-        const context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        });
-
-        page = await context.newPage();
+            viewport: { width: 1366, height: 768 },
+            locale: 'en-US',
+            timezoneId: 'Asia/Kolkata',
+        }));
 
         console.log(`📍 Navigating to: ${postUrl}`);
         
@@ -104,7 +99,10 @@ export async function extractFacebookPostLikes(postUrl) {
         if (page) {
             await page.close().catch(() => {});
         }
-        if (browser) {
+        if (ownsContext && context) {
+            await context.close().catch(() => {});
+        }
+        if (ownsBrowser && browser) {
             await browser.close().catch(() => {});
         }
     }

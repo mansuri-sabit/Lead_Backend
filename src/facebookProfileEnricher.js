@@ -3,7 +3,7 @@
  * collects phone-like strings, address hints, and external social links.
  * Requires the same logged-in / headless context as Filter Bot (FILTER_BOT_HEADLESS).
  */
-import { chromium } from 'playwright';
+import { createStealthPage } from './browserFlow.js';
 
 const HEADLESS = process.env.FILTER_BOT_HEADLESS !== '0';
 
@@ -269,29 +269,21 @@ export async function enrichFacebookProfile(input = {}) {
     const anchorHref = input.anchorHref ?? null;
 
     let browser;
+    let context;
     let page;
+    let ownsBrowser = true;
+    let ownsContext = true;
 
     try {
         console.log(
             `[Agent2] single enrich row profileUrl=${profileUrlIn ? 'yes' : 'no'} anchor=${anchorHref ? 'yes' : 'no'}`
         );
-        browser = await chromium.launch({
+        ({ browser, context, page, ownsBrowser, ownsContext } = await createStealthPage({
             headless: HEADLESS,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled'
-            ]
-        });
-
-        const context = await browser.newContext({
-            userAgent:
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport: { width: 1366, height: 768 }
-        });
-
-        page = await context.newPage();
+            viewport: { width: 1366, height: 768 },
+            locale: 'en-US',
+            timezoneId: 'Asia/Kolkata',
+        }));
 
         const profileUrlUsed = await resolveProfileUrl(page, {
             profileUrl: profileUrlIn,
@@ -328,6 +320,7 @@ export async function enrichFacebookProfile(input = {}) {
         };
     } finally {
         if (page) await page.close().catch(() => {});
-        if (browser) await browser.close().catch(() => {});
+        if (ownsContext && context) await context.close().catch(() => {});
+        if (ownsBrowser && browser) await browser.close().catch(() => {});
     }
 }

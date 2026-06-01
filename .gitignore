@@ -2,6 +2,17 @@
 .env
 .env.local
 .env.production
+fb-filter-bot-storage.json
+
+# Large archives / blobs — never commit (bloats repo & build)
+*.zip
+*.7z
+.git.zip
+Backend_add_ocr.7z
+
+# Tool output / screenshots
+*.output
+screenshots
 
 # Dependencies
 node_modules

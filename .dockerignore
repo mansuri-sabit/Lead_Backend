@@ -1,0 +1,8 @@
+node_modules
+.git
+.git.zip
+*.7z
+.env
+playwright-browsers
+screenshots
+*.output

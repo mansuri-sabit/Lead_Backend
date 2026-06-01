@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 import path from 'path';
+import fs from 'fs';
 import dns from 'node:dns';
 import { spawn, execFile } from 'child_process';
 import mongoose from 'mongoose';
@@ -28,11 +29,22 @@ import {
     getFilterBotCommentersForRows,
     updateFilterBotCommenterEnrichment,
     claimPendingFilterBotCommenters,
-    getFilterBotRunStatus
+    getFilterBotRunStatus,
+    createLeadCaptureRun,
+    updateLeadCaptureAgent1,
+    updateLeadCaptureAgent2,
+    finalizeLeadCaptureRun,
+    listLeadCaptureRuns,
+    getLeadCaptureRunResults,
+    getLatestLeadCaptureRun,
+    deleteLeadCaptureRun,
+    LeadCaptureRun,
+    LeadCaptureResult
 } from './src/db.js';
 import { schedulerService } from './src/scheduler.js';
 import GoogleAdsScraper from './src/googleAdsScraper.js';
 import { requireAuth, signToken } from './src/auth.js';
+import { auditWebsite } from './src/leadCaptureWebsiteAudit.js';
 
 dotenv.config();
 
@@ -84,6 +96,17 @@ app.use(helmet({
 
 // Compression: gzip responses (reduces bandwidth 5-10x for JSON)
 app.use(compression());
+
+// Static screenshots — Lead Capture popup/viewport thumbnails written to disk
+// instead of stored as base64 in MongoDB. Cached aggressively (immutable per row).
+const SCREENSHOTS_DIR = path.resolve(process.cwd(), 'screenshots');
+try { fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true }); } catch {}
+app.use('/screenshots', express.static(SCREENSHOTS_DIR, {
+    maxAge: '7d',
+    immutable: true,
+    fallthrough: true,
+    setHeaders: (res) => res.setHeader('Cache-Control', 'public, max-age=604800, immutable'),
+}));
 
 // Request body size limits (prevents large-payload DoS)
 app.use(express.json({ limit: '1mb' }));
@@ -1269,6 +1292,361 @@ app.post('/api/facebook-filter-bot/enrich-profiles', requireAuth, filterBotEnric
     } catch (err) {
         console.error('POST /api/facebook-filter-bot/enrich-profiles:', err);
         res.status(500).json({ error: 'Profile enrichment failed', details: err?.message });
+    }
+});
+
+// ─── Lead Capture Routes ─────────────────────────────────────────────────────
+
+const leadCaptureLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 10,
+    message: { error: 'Too many lead capture requests. Slow down.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+const leadCaptureReadLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 120,
+    message: { error: 'Too many requests.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+/**
+ * POST /api/lead-capture/run — Start a multi-agent lead capture pipeline.
+ * Body: { companies: ["School A", "Real Estate B", ...] }
+ */
+app.post('/api/lead-capture/run', requireAuth, leadCaptureLimiter, async (req, res) => {
+    const startTime = Date.now();
+    let runId = null;
+
+    try {
+        const { companies } = req.body;
+        const userId = req.userId;
+
+        if (!Array.isArray(companies) || companies.length === 0) {
+            return res.status(400).json({ error: 'companies must be a non-empty array of business names' });
+        }
+        if (companies.length > 50) {
+            return res.status(400).json({ error: 'Maximum 50 companies per run' });
+        }
+
+        const cleaned = companies
+            .map(c => (typeof c === 'string' ? c.trim() : ''))
+            .filter(c => c.length >= 2 && c.length <= 300);
+
+        if (cleaned.length === 0) {
+            return res.status(400).json({ error: 'No valid company names provided (min 2 chars each)' });
+        }
+
+        // Create run + seed result rows
+        const created = await createLeadCaptureRun(userId, cleaned);
+        runId = created.runId;
+
+        console.log(`[LeadCapture] Run ${runId} started — ${cleaned.length} companies`);
+
+        // Return immediately, process in background
+        res.json({
+            success: true,
+            runId,
+            totalCompanies: cleaned.length,
+            message: 'Lead capture pipeline started. Poll /api/lead-capture/runs/:runId for results.',
+        });
+
+        // ── Background multi-agent processing ──
+        (async () => {
+            let completedCount = 0;
+            let failedCount = 0;
+            let sharedSession = null;
+
+            try {
+                const { scrapeGoogleMaps } = await import('./src/leadCaptureGoogleMaps.js');
+                const { analyzeWebsite } = await import('./src/leadCaptureWebsiteAnalyzer.js');
+                const { createStealthSession } = await import('./src/browserFlow.js');
+
+                try {
+                    sharedSession = await createStealthSession({
+                        headless: process.env.LEAD_CAPTURE_HEADLESS === '1',
+                        locale: 'en-US',
+                        timezoneId: 'Asia/Kolkata',
+                        viewport: { width: 1920, height: 1080 },
+                    });
+                } catch (sessionErr) {
+                    console.warn(`[LeadCapture] Shared browser session init failed: ${sessionErr?.message || sessionErr}`);
+                }
+
+                for (let i = 0; i < cleaned.length; i++) {
+                    const companyName = cleaned[i];
+                    console.log(`[LeadCapture][${i + 1}/${cleaned.length}] Processing: "${companyName}"`);
+
+                    // ── Agent 1: Google Maps ──
+                    let mapsData = null;
+                    try {
+                        await updateLeadCaptureAgent1(userId, runId, i, { agent1Status: 'running' });
+                        mapsData = await scrapeGoogleMaps(companyName, sharedSession);
+                        await updateLeadCaptureAgent1(userId, runId, i, {
+                            agent1Status: 'completed',
+                            mapsAddress: mapsData.address || '',
+                            mapsPhone: mapsData.phone || '',
+                            mapsWebsite: mapsData.website || '',
+                            mapsRating: mapsData.rating || '',
+                            mapsReviewCount: mapsData.reviewCount || '',
+                            mapsCategory: mapsData.category || '',
+                            openingTime: mapsData.openingTime || '',
+                            closingTime: mapsData.closingTime || '',
+                            currentStatus: mapsData.currentStatus || '',
+                            openingHours: mapsData.openingHours || [],
+                        });
+                        console.log(`[LeadCapture] Agent1 done for "${companyName}" — website: ${mapsData.website || '(none)'}`);
+                    } catch (a1Err) {
+                        console.error(`[LeadCapture] Agent1 FAILED for "${companyName}":`, a1Err?.message);
+                        await updateLeadCaptureAgent1(userId, runId, i, {
+                            agent1Status: 'failed',
+                            agent1Error: a1Err?.message || 'Unknown error',
+                        });
+                    }
+
+                    // ── Agent 2: Website Analyzer (only if we got a website) ──
+                    const websiteUrl = mapsData?.website || '';
+                    let analysisFailed = false;
+                    if (websiteUrl) {
+                        try {
+                            await updateLeadCaptureAgent2(userId, runId, i, { agent2Status: 'running', websiteUrl });
+                            const analysis = await analyzeWebsite(websiteUrl, companyName, sharedSession, {
+                                runId,
+                                rowIndex: i,
+                                mapsPhone: mapsData?.phone || '',
+                            });
+                            await updateLeadCaptureAgent2(userId, runId, i, {
+                                agent2Status: 'completed',
+                                websiteUrl: analysis.websiteUrl,
+                                popupDetected: analysis.popupDetected,
+                                popupType: analysis.popupType,
+                                extractedText: analysis.extractedText,
+                                ocrText: analysis.ocrText,
+                                interpretedMeaning: analysis.interpretedMeaning,
+                                score: analysis.score,
+                                signals: analysis.signals,
+                                summary: analysis.summary,
+                                popupScreenshot: analysis.popupScreenshot,
+                                fullScreenshot: analysis.fullScreenshot,
+                                pageTitle: analysis.pageTitle,
+                                lastUpdatedYears: analysis.lastUpdatedYears,
+                                lastUpdatedAt: analysis.lastUpdatedAt,
+                                freshnessSource: analysis.freshnessSource,
+                                freshnessScore: analysis.freshnessScore,
+                                techProfile: analysis.techProfile,
+                                recommendedServices: analysis.recommendedServices,
+                            });
+                            console.log(`[LeadCapture] Agent2 done for "${companyName}" — score: ${analysis.score}`);
+                        } catch (a2Err) {
+                            analysisFailed = true;
+                            console.error(`[LeadCapture] Agent2 FAILED for "${companyName}":`, a2Err?.message);
+                            await updateLeadCaptureAgent2(userId, runId, i, {
+                                agent2Status: 'failed',
+                                agent2Error: a2Err?.message || 'Unknown error',
+                            });
+                        }
+                    } else {
+                        await updateLeadCaptureAgent2(userId, runId, i, {
+                            agent2Status: 'skipped',
+                            agent2Error: 'No website URL found on Google Maps',
+                        });
+                    }
+
+                    // Track per-company outcome based on actual agent statuses,
+                    // not the loop counter (so failures don't masquerade as successes).
+                    const a1Failed = !mapsData;
+                    const a2Failed = !!websiteUrl && analysisFailed;
+                    if (a1Failed || a2Failed) failedCount++;
+                    else completedCount++;
+
+                    // Update run progress
+                    await finalizeLeadCaptureRun(userId, runId, {
+                        status: 'running',
+                        processedCount: i + 1,
+                        completedCount,
+                        failedCount,
+                        processingTimeMs: Date.now() - startTime,
+                    });
+
+                    // ── Self-heal: if the shared browser/context died (e.g., Chrome
+                    // crashed, OS killed it, persistent context closed unexpectedly),
+                    // rebuild the session before the next company instead of failing
+                    // the entire remaining batch. Cheap probe: try a no-op pages() call.
+                    if (sharedSession) {
+                        let alive = true;
+                        try {
+                            await sharedSession.context?.pages();
+                        } catch {
+                            alive = false;
+                        }
+                        if (!alive && i + 1 < cleaned.length) {
+                            console.warn('[LeadCapture] Shared session appears dead — rebuilding...');
+                            try {
+                                await sharedSession.context?.close().catch(() => {});
+                                if (sharedSession.ownsBrowser) {
+                                    await sharedSession.browser?.close().catch(() => {});
+                                }
+                            } catch {}
+                            try {
+                                sharedSession = await createStealthSession({
+                                    headless: process.env.LEAD_CAPTURE_HEADLESS === '1',
+                                    locale: 'en-US',
+                                    timezoneId: 'Asia/Kolkata',
+                                    viewport: { width: 1920, height: 1080 },
+                                });
+                                console.log('[LeadCapture] Session rebuilt successfully.');
+                            } catch (rebuildErr) {
+                                console.error(`[LeadCapture] Session rebuild failed: ${rebuildErr?.message}`);
+                                sharedSession = null;
+                            }
+                        }
+                    }
+                }
+            } catch (pipelineErr) {
+                console.error(`[LeadCapture] Pipeline error for run ${runId}:`, pipelineErr);
+                failedCount = cleaned.length - completedCount;
+            } finally {
+                if (sharedSession?.ownsContext && sharedSession?.context) {
+                    await sharedSession.context.close().catch(() => {});
+                }
+                if (sharedSession?.ownsBrowser && sharedSession?.browser) {
+                    await sharedSession.browser.close().catch(() => {});
+                }
+            }
+
+            // Finalize the run
+            await finalizeLeadCaptureRun(userId, runId, {
+                status: failedCount === cleaned.length ? 'failed' : 'completed',
+                processedCount: cleaned.length,
+                completedCount,
+                failedCount,
+                processingTimeMs: Date.now() - startTime,
+            });
+
+            console.log(`[LeadCapture] Run ${runId} DONE — completed: ${completedCount}, failed: ${failedCount}, time: ${Date.now() - startTime}ms`);
+        })();
+
+    } catch (error) {
+        console.error('POST /api/lead-capture/run error:', error);
+        if (runId) {
+            await finalizeLeadCaptureRun(req.userId, runId, {
+                status: 'failed',
+                errorMessage: error?.message || 'Unknown error',
+                processingTimeMs: Date.now() - startTime,
+            });
+        }
+        res.status(500).json({ error: 'Failed to start lead capture pipeline', details: error?.message });
+    }
+});
+
+/**
+ * GET /api/lead-capture/runs — List all runs for current user.
+ */
+app.get('/api/lead-capture/runs', requireAuth, leadCaptureReadLimiter, async (req, res) => {
+    try {
+        const runs = await listLeadCaptureRuns(req.userId);
+        res.json({ runs });
+    } catch (err) {
+        console.error('GET /api/lead-capture/runs:', err);
+        res.status(500).json({ error: 'Failed to load lead capture runs' });
+    }
+});
+
+/**
+ * GET /api/lead-capture/latest — Get latest run with results (paginated).
+ */
+app.get('/api/lead-capture/latest', requireAuth, leadCaptureReadLimiter, async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+        const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit || '100'), 10) || 100));
+        const data = await getLatestLeadCaptureRun(req.userId, page, limit);
+        res.json(data);
+    } catch (err) {
+        console.error('GET /api/lead-capture/latest:', err);
+        res.status(500).json({ error: 'Failed to load latest lead capture data' });
+    }
+});
+
+/**
+ * GET /api/lead-capture/runs/:runId — Get specific run with results.
+ */
+app.get('/api/lead-capture/runs/:runId', requireAuth, leadCaptureReadLimiter, async (req, res) => {
+    try {
+        const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+        const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit || '100'), 10) || 100));
+        const data = await getLeadCaptureRunResults(req.userId, req.params.runId, page, limit);
+        if (!data.run) return res.status(404).json({ error: 'Run not found' });
+        res.json(data);
+    } catch (err) {
+        console.error('GET /api/lead-capture/runs/:runId:', err);
+        res.status(500).json({ error: 'Failed to load lead capture results' });
+    }
+});
+
+/**
+ * DELETE /api/lead-capture/runs/:runId — Delete a run and all results.
+ */
+app.delete('/api/lead-capture/runs/:runId', requireAuth, leadCaptureReadLimiter, async (req, res) => {
+    try {
+        const result = await deleteLeadCaptureRun(req.userId, req.params.runId);
+        res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('DELETE /api/lead-capture/runs/:runId:', err);
+        res.status(500).json({ error: 'Failed to delete lead capture run' });
+    }
+});
+
+/**
+ * POST /api/lead-capture/audit — Agent 3: run an on-demand website audit
+ * for a single LeadCaptureResult. Caches the result on the document;
+ * pass { refresh: true } to force a re-run.
+ * Body: { resultId: string, refresh?: boolean }
+ */
+app.post('/api/lead-capture/audit', requireAuth, leadCaptureReadLimiter, async (req, res) => {
+    try {
+        const { resultId, refresh } = req.body || {};
+        if (!resultId) return res.status(400).json({ error: 'resultId is required' });
+
+        const doc = await LeadCaptureResult.findOne({ _id: resultId, userId: req.userId });
+        if (!doc) return res.status(404).json({ error: 'Result not found' });
+
+        if (doc.audit && doc.audit.status === 'completed' && !refresh) {
+            return res.json({ audit: doc.audit, cached: true });
+        }
+
+        if (!doc.websiteUrl) {
+            const failed = {
+                status: 'failed',
+                error: 'No website URL available for this lead',
+                auditedAt: new Date(),
+            };
+            doc.audit = failed;
+            doc.auditStatus = 'failed';
+            await doc.save();
+            return res.json({ audit: failed, cached: false });
+        }
+
+        doc.auditStatus = 'running';
+        await doc.save();
+
+        const audit = await auditWebsite({
+            websiteUrl: doc.websiteUrl,
+            companyName: doc.companyName,
+            category: doc.mapsCategory || '',
+            countryHint: doc.mapsAddress || '',
+        });
+
+        doc.audit = audit;
+        doc.auditStatus = audit.status === 'completed' ? 'completed' : 'failed';
+        await doc.save();
+
+        res.json({ audit, cached: false });
+    } catch (err) {
+        console.error('POST /api/lead-capture/audit:', err);
+        res.status(500).json({ error: 'Audit failed', details: err?.message });
     }
 });
 

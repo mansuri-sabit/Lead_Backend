@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { chromium } from 'playwright';
+import { createStealthPage } from './browserFlow.js';
 
 const USE_SAMPLE_FALLBACK = process.env.FILTER_BOT_USE_SAMPLE_FALLBACK === '1';
 const HEADLESS = process.env.FILTER_BOT_HEADLESS !== '0';
@@ -29,20 +29,13 @@ export async function extractFacebookPostComments(postUrl, action = 'Comment', o
             : null;
     const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
     let browser;
+    let context;
     let page;
+    let ownsBrowser = true;
+    let ownsContext = true;
 
     try {
         console.log(`🤖 Starting Facebook Filter Bot for ${action} extraction... (headless=${HEADLESS})`);
-
-        browser = await chromium.launch({
-            headless: HEADLESS,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled'
-            ]
-        });
 
         const storageStatePath = resolveStorageStatePath();
         if (storageStatePath) {
@@ -55,14 +48,13 @@ export async function extractFacebookPostComments(postUrl, action = 'Comment', o
             );
         }
 
-        const context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        ({ browser, context, page, ownsBrowser, ownsContext } = await createStealthPage({
+            headless: HEADLESS,
             viewport: { width: 1920, height: 1080 },
             locale: 'en-US',
-            ...(storageStatePath ? { storageState: storageStatePath } : {})
-        });
-
-        page = await context.newPage();
+            timezoneId: 'Asia/Kolkata',
+            storageState: storageStatePath || undefined,
+        }));
 
         console.log(`📍 Navigating to: ${postUrl}`);
 
@@ -228,7 +220,10 @@ export async function extractFacebookPostComments(postUrl, action = 'Comment', o
         if (page) {
             await page.close().catch(() => {});
         }
-        if (browser) {
+        if (ownsContext && context) {
+            await context.close().catch(() => {});
+        }
+        if (ownsBrowser && browser) {
             await browser.close().catch(() => {});
         }
     }
