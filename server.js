@@ -217,9 +217,11 @@ app.use((req, res, next) => {
 });
 
 // CORS: strict in production, permissive in dev
+// Deployed frontend origin (no trailing slash — browsers send Origin without it).
+const DEPLOYED_FRONTEND_URL = 'https://lead-frontend-mejb.onrender.com';
 const corsOrigins = IS_PRODUCTION
-    ? [process.env.FRONTEND_URL].filter(Boolean)
-    : ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:5174', 'http://localhost:5175', process.env.FRONTEND_URL].filter(Boolean);
+    ? [process.env.FRONTEND_URL, DEPLOYED_FRONTEND_URL].filter(Boolean)
+    : ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:5174', 'http://localhost:5175', process.env.FRONTEND_URL, DEPLOYED_FRONTEND_URL].filter(Boolean);
 
 app.use(cors({
     origin: corsOrigins,
